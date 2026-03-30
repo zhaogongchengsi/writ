@@ -20,6 +20,7 @@ use gpui::{
     Hsla, IntoElement, KeyDownEvent, ListAlignment, ListState, ModifiersChangedEvent, MouseButton,
     ReadGlobal, Render, Rgba, TextRun, Window, anchored, div, font, list, point, prelude::*, px,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Marker type for text selection drag operations.
 /// Used with GPUI's on_drag/on_drag_move to receive mouse events outside element bounds.
@@ -137,6 +138,30 @@ pub struct EditorState {
 }
 
 impl EditorState {
+    /// Return the byte range of the grapheme cluster immediately before `cursor_pos`.
+    fn previous_grapheme_range(&self, cursor_pos: usize) -> Option<Range<usize>> {
+        if cursor_pos == 0 {
+            return None;
+        }
+
+        let text = self.buffer.text();
+        let before = text.get(..cursor_pos)?;
+        let (start, grapheme) = before.grapheme_indices(true).next_back()?;
+        Some(start..(start + grapheme.len()))
+    }
+
+    /// Return the byte range of the grapheme cluster immediately after `cursor_pos`.
+    fn next_grapheme_range(&self, cursor_pos: usize) -> Option<Range<usize>> {
+        let text = self.buffer.text();
+        if cursor_pos >= text.len() {
+            return None;
+        }
+        let after = text.get(cursor_pos..)?;
+        let (rel_start, grapheme) = after.grapheme_indices(true).next()?;
+        let start = cursor_pos + rel_start;
+        Some(start..(start + grapheme.len()))
+    }
+
     pub fn new(content: &str) -> Self {
         let buffer: Buffer = content.parse().unwrap_or_default();
         Self {
@@ -1264,9 +1289,11 @@ impl EditorState {
             return;
         }
 
-        let new_pos = cursor_pos - 1;
-        self.buffer.delete(new_pos..cursor_pos, cursor_pos);
-        self.selection = Selection::new(new_pos, new_pos);
+        let Some(delete_range) = self.previous_grapheme_range(cursor_pos) else {
+            return;
+        };
+        self.buffer.delete(delete_range.clone(), cursor_pos);
+        self.selection = Selection::new(delete_range.start, delete_range.start);
         self.propagate_checkbox_after_edit();
     }
 
@@ -1285,9 +1312,9 @@ impl EditorState {
             self.delete_selection();
         } else if self.cursor().offset < self.buffer.len_bytes() {
             let cursor_before = self.cursor().offset;
-            let next = self.cursor().move_right(&self.buffer);
-            self.buffer
-                .delete(cursor_before..next.offset, cursor_before);
+            if let Some(delete_range) = self.next_grapheme_range(cursor_before) {
+                self.buffer.delete(delete_range, cursor_before);
+            }
         }
         self.propagate_checkbox_after_edit();
     }
@@ -1686,6 +1713,8 @@ pub struct Editor {
     autocomplete: Option<AutocompleteState>,
     /// Pending autocomplete fetch (for debouncing).
     autocomplete_debounce_task: Option<gpui::Task<()>>,
+    /// True while IME composition is active.
+    composing: bool,
     /// Whether this is the primary editor that updates global state (status bar, title bar).
     /// Only one editor should have this set to true at a time.
     is_primary: bool,
@@ -1746,6 +1775,7 @@ impl Editor {
             github_refs_by_line: HashMap::new(),
             autocomplete: None,
             autocomplete_debounce_task: None,
+            composing: false,
             is_primary: true, // Default to primary; secondary editors should call set_primary(false)
             instance_id: NEXT_EDITOR_ID.fetch_add(1, Ordering::Relaxed),
             diff_state: None,
@@ -3163,6 +3193,20 @@ impl Editor {
         }
 
         let keystroke = &event.keystroke;
+        if self.composing {
+            if keystroke.modifiers.control
+                || keystroke.modifiers.platform
+                || keystroke.modifiers.alt
+            {
+                return;
+            }
+            if matches!(
+                keystroke.key.as_str(),
+                "backspace" | "delete" | "enter" | "tab"
+            ) {
+                return;
+            }
+        }
 
         // Handle autocomplete keyboard navigation
         if self.autocomplete.is_some() {
@@ -3344,11 +3388,11 @@ impl Editor {
                         self.insert_text(key_char);
                     }
 
-                    if key_char == ">" {
+                    if !self.composing && key_char == ">" {
                         self.state.maybe_complete_blockquote_marker();
                     }
 
-                    if key_char == "`" || key_char == "~" {
+                    if !self.composing && (key_char == "`" || key_char == "~") {
                         self.state.maybe_complete_code_fence();
                     }
 
@@ -3405,6 +3449,16 @@ impl Editor {
     /// Returns true if currently in streaming mode.
     pub fn is_streaming(&self) -> bool {
         self.streaming_mode
+    }
+
+    /// Set whether the editor is in an active IME composition session.
+    pub fn set_composing(&mut self, composing: bool) {
+        self.composing = composing;
+    }
+
+    /// Returns true when IME composition is active.
+    pub fn is_composing(&self) -> bool {
+        self.composing
     }
 
     /// Returns the current cursor position as a byte offset.
@@ -4616,6 +4670,27 @@ mod tests {
         }
 
         #[test]
+        fn backspace_deletes_single_chinese_grapheme() {
+            let mut state = editor_with_cursor("中文|");
+            state.delete_backward();
+            assert_editor_eq(&state, "中|");
+        }
+
+        #[test]
+        fn backspace_at_chinese_line_end_does_not_swallow_newline() {
+            let mut state = editor_with_cursor("你|\n好");
+            state.delete_backward();
+            assert_editor_eq(&state, "|\n好");
+        }
+
+        #[test]
+        fn backspace_deletes_emoji_zwj_as_single_grapheme() {
+            let mut state = editor_with_cursor("a👨‍👩‍👧‍👦|b");
+            state.delete_backward();
+            assert_editor_eq(&state, "a|b");
+        }
+
+        #[test]
         fn backspace_on_empty_line_after_list_joins() {
             let mut state = editor_with_cursor("- item one\n|");
             state.delete_backward();
@@ -4807,6 +4882,13 @@ mod tests {
             // Delete 'a' - still has content, propagation runs
             state.delete_forward();
             assert_editor_eq(&state, "- [ ] hey\n  - [ ] |b");
+        }
+
+        #[test]
+        fn delete_forward_deletes_emoji_zwj_as_single_grapheme() {
+            let mut state = editor_with_cursor("|👨‍👩‍👧‍👦x");
+            state.delete_forward();
+            assert_editor_eq(&state, "|x");
         }
 
         #[test]
